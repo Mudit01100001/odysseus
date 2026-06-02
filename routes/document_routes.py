@@ -593,6 +593,12 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if req.session_id is not None:
                 # Empty string = unlink from session
                 doc.session_id = req.session_id if req.session_id else None
+                # Clear the in-memory active-document pointer when a doc is
+                # unlinked so the AI stops referencing a closed tab.
+                if not req.session_id:
+                    from src.tool_implementations import get_active_document, set_active_document
+                    if get_active_document() == doc_id:
+                        set_active_document(None)
             db.commit()
             db.refresh(doc)
             return _doc_to_dict(doc)
@@ -616,6 +622,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             _verify_doc_owner(db, doc, user)
             doc.is_active = False
             db.commit()
+            # Clear in-memory active-document pointer on deletion too.
+            from src.tool_implementations import get_active_document, set_active_document
+            if get_active_document() == doc_id:
+                set_active_document(None)
             return {"status": "deleted", "id": doc_id}
         except HTTPException:
             raise
