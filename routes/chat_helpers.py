@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -11,6 +12,7 @@ from core.models import ChatMessage
 from core.database import SessionLocal
 from core.database import Session as DBSession, ModelEndpoint
 from src.llm_core import normalize_model_id
+from src.endpoint_resolver import normalize_base
 from src.context_compactor import maybe_compact, trim_for_context
 from src.auth_helpers import get_current_user
 from src.prompt_security import untrusted_context_message
@@ -149,6 +151,9 @@ async def auto_name_session(session_manager, sess):
         t_url, t_model, t_headers = resolve_task_endpoint(
             sess.endpoint_url, sess.model, sess.headers,
         )
+        if not t_model:
+            logger.debug("[auto-name] No model provided, skipping")
+            return
 
         # max_tokens big enough that reasoning models (Minimax M2,
         # DeepSeek R1, QwQ, etc.) have headroom for <think>…</think>
@@ -188,7 +193,7 @@ def try_fallback_endpoint(sess, session_id: str) -> dict | None:
     Returns {"model": ..., "endpoint_url": ..., "endpoint_name": ...} or None.
     """
     import requests as _req
-    from src.endpoint_resolver import build_chat_url, build_headers, normalize_base
+    from src.endpoint_resolver import build_chat_url, build_headers, build_models_url, normalize_base
 
     current_url = sess.endpoint_url or ""
     db = SessionLocal()
@@ -205,15 +210,19 @@ def try_fallback_endpoint(sess, session_id: str) -> dict | None:
         if current_url and base in current_url:
             continue
         # Quick ping
-        ping_url = base + "/models"
-        headers = {}
-        if ep.api_key:
-            headers["Authorization"] = f"Bearer {ep.api_key}"
+        ping_url = build_models_url(base)
+        headers = build_headers(ep.api_key, base)
         try:
             r = _req.get(ping_url, headers=headers, timeout=5)
             r.raise_for_status()
             data = r.json()
             models = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+            if not models:
+                models = [
+                    m.get("name") or m.get("model")
+                    for m in (data.get("models") or [])
+                    if m.get("name") or m.get("model")
+                ]
             if not models:
                 continue
             # Found a working endpoint — update session
@@ -330,6 +339,63 @@ def resolve_session_auth(sess, session_id: str):
         logger.warning(f"Failed to resolve session headers: {e}")
 
 
+def _match_cached_model_id(requested: str, models) -> Optional[str]:
+    if not requested or not models:
+        return None
+    model_ids = [str(m) for m in models if m]
+    if requested in model_ids:
+        return requested
+
+    req_base = os.path.basename(requested.rstrip("/"))
+    for model_id in model_ids:
+        if os.path.basename(model_id.rstrip("/")) == req_base:
+            return model_id
+    return None
+
+
+def _normalize_model_id_from_cache(sess) -> Optional[str]:
+    """Use stored endpoint model IDs before falling back to a live /models probe."""
+    endpoint_url = getattr(sess, "endpoint_url", "") or ""
+    requested = getattr(sess, "model", "") or ""
+    if not endpoint_url or not requested:
+        return None
+
+    try:
+        session_base = normalize_base(endpoint_url)
+    except Exception:
+        session_base = endpoint_url.rstrip("/")
+    if not session_base:
+        return None
+
+    db = SessionLocal()
+    try:
+        endpoints = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True).all()
+        for ep in endpoints:
+            try:
+                if normalize_base(getattr(ep, "base_url", "") or "") != session_base:
+                    continue
+            except Exception:
+                continue
+
+            raw_models = getattr(ep, "cached_models", None)
+            if not raw_models:
+                continue
+            try:
+                models = json.loads(raw_models) if isinstance(raw_models, str) else raw_models
+            except Exception:
+                continue
+
+            matched = _match_cached_model_id(requested, models)
+            if matched:
+                return matched
+    except Exception as e:
+        logger.debug("Cached model normalization skipped: %s", e)
+    finally:
+        db.close()
+
+    return None
+
+
 async def build_chat_context(
     sess,
     request,
@@ -430,8 +496,9 @@ async def build_chat_context(
     for transcript in preprocessed.youtube_transcripts:
         preface.append(untrusted_context_message("youtube transcript", transcript))
 
-    # Normalize model ID
-    norm = normalize_model_id(sess.endpoint_url, sess.model)
+    # Normalize model ID. Prefer cached endpoint models so group chat does not
+    # re-hit slow local /models endpoints on every participant turn.
+    norm = _normalize_model_id_from_cache(sess) or normalize_model_id(sess.endpoint_url, sess.model)
     if norm:
         sess.model = norm
 

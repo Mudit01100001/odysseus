@@ -12,6 +12,7 @@ venv/
 
 # Environment
 .env
+.env.bak.*
 !.env.example
 
 # Data — all user data stays local
@@ -66,6 +67,11 @@ output.txt.txt
 !docs/*.png
 !docs/*.gif
 !docs/*.webp
+# …and curated docs/ subfolder assets (e.g. accessibility before/after shots).
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.gif
+!docs/**/*.webp
 
 # PWA icons shipped with the app
 !static/icon-192.png
@@ -80,6 +86,8 @@ research_data/
 
 # Internal dev/review notes — not for public repo
 dev-docs/
+# Windows-port working docs (local only, not for public repo)
+docs/windows-port/
 
 # Local config
 compound.config.json

@@ -180,6 +180,8 @@ class DeepResearcher:
         max_urls_per_round: int = 3,
         max_content_chars: int = 15000,
         max_report_tokens: int = 8192,
+        extraction_timeout: int = 90,
+        extraction_concurrency: int = 3,
         min_rounds: int = 2,
         max_empty_rounds: int = 2,
         synthesis_window: int = 10,
@@ -197,6 +199,8 @@ class DeepResearcher:
         self.max_urls_per_round = max_urls_per_round
         self.max_content_chars = max_content_chars
         self.max_report_tokens = max_report_tokens
+        self.extraction_timeout = min(3600, max(15, int(extraction_timeout or 90)))
+        self.extraction_concurrency = min(12, max(1, int(extraction_concurrency or 3)))
         self.min_rounds = min_rounds
         self.max_empty_rounds = max_empty_rounds
         self.synthesis_window = synthesis_window
@@ -492,11 +496,16 @@ class DeepResearcher:
         if self._cancelled or self._time_exceeded():
             return all_findings
 
-        # Fetch and extract all URLs concurrently
-        extract_tasks = [
-            self._fetch_and_extract(r["url"], question, r.get("title", ""))
-            for r in urls_to_fetch
-        ]
+        # Fetch and extract URLs with backpressure. Local model servers often
+        # serialize requests behind one GPU; flooding them makes every request
+        # slower and can trip the extraction timeout.
+        semaphore = asyncio.Semaphore(self.extraction_concurrency)
+
+        async def _bounded_extract(result: Dict) -> Optional[Dict]:
+            async with semaphore:
+                return await self._fetch_and_extract(result["url"], question, result.get("title", ""))
+
+        extract_tasks = [_bounded_extract(r) for r in urls_to_fetch]
         results_gathered = await asyncio.gather(*extract_tasks, return_exceptions=True)
 
         for result in results_gathered:
@@ -526,7 +535,9 @@ class DeepResearcher:
                 return []
 
             # Try primary provider, then fallbacks
-            for prov in _build_provider_chain(provider):
+            chain = _build_provider_chain(provider)
+            raised = False
+            for prov in chain:
                 try:
                     results = await asyncio.to_thread(_call_provider, prov, query, 10)
                     if results:
@@ -535,8 +546,20 @@ class DeepResearcher:
                             self.providers_used.append(prov)
                         return results
                 except Exception as e:
+                    raised = True
                     logger.warning(f"Research search: {prov} failed: {e}")
                     self._last_search_error = f"{prov}: {e}"
+            # Every provider ran but none returned results. If none of them
+            # raised, record an actionable reason here — otherwise this empty
+            # path leaves `_last_search_error` unset and the caller surfaces a
+            # bare "unknown error" (issue #344). This is exactly the SearXNG
+            # case where the service is reachable but all its engines fail, so
+            # each provider returns [] without throwing.
+            if not raised:
+                self._last_search_error = (
+                    f"no results from search provider(s): "
+                    f"{', '.join(chain) if chain else provider}"
+                )
             return []
         except Exception as e:
             logger.error(f"Search failed for '{query}': {e}")
@@ -576,7 +599,7 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=2048,
-                timeout=45,
+                timeout=self.extraction_timeout,
             )
             parsed = self._parse_json_object(response)
             if parsed:
